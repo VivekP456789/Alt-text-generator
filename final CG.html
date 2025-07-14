@@ -1,0 +1,550 @@
+import React, { useState, useCallback } from 'react';
+
+// Main App component
+const App = () => {
+  // State to hold multiple selected images (from file or URL) and their data
+  const [selectedImages, setSelectedImages] = useState([]);
+  // State for overall loading status during batch generation
+  const [overallLoading, setOverallLoading] = useState(false);
+  // State for overall error messages
+  const [overallError, setOverallError] = useState('');
+  // State for drag-and-drop visual feedback
+  const [dragOver, setDragOver] = useState(false);
+  // State for copy to clipboard confirmation message
+  const [copyMessage, setCopyMessage] = useState('');
+  // State for the URL input field
+  const [imageUrlInput, setImageUrlInput] = useState('');
+  // State for loading specific to URL generation
+  const [urlLoading, setUrlLoading] = useState(false);
+
+  // Function to handle image files (from input or drop)
+  const handleFiles = useCallback((files) => {
+    setOverallError(''); // Clear any previous overall errors
+    setCopyMessage(''); // Clear copy message
+
+    const newImages = Array.from(files)
+      .filter(file => file.type.startsWith('image/')) // Only process image files
+      .map(file => ({
+        id: crypto.randomUUID(), // Unique ID for each image
+        sourceType: 'file', // Mark as file source
+        file: file,
+        previewUrl: URL.createObjectURL(file), // Create a URL for image preview
+        altText: '',
+        loading: false,
+        error: '',
+        mimeType: file.type // Store MIME type for API call
+      }));
+
+    if (newImages.length === 0 && files.length > 0) {
+      setOverallError('No valid image files were selected. Please upload JPG, PNG, JPEG, or WEBP.');
+    }
+
+    setSelectedImages(prevImages => [...prevImages, ...newImages]);
+  }, []);
+
+  // Handle file input change
+  const handleImageChange = (event) => {
+    handleFiles(event.target.files);
+    event.target.value = null; // Clear the input so same file can be selected again
+  };
+
+  // Handle drag over event
+  const handleDragOver = (event) => {
+    event.preventDefault(); // Prevent default to allow drop
+    setDragOver(true);
+  };
+
+  // Handle drag leave event
+  const handleDragLeave = (event) => {
+    event.preventDefault();
+    setDragOver(false);
+  };
+
+  // Handle drop event
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setDragOver(false);
+    if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+      handleFiles(event.dataTransfer.files);
+      event.dataTransfer.clearData(); // Clear data after processing
+    }
+  };
+
+  // Function to remove a single image from the list
+  const removeImage = (id) => {
+    setSelectedImages(prevImages => prevImages.filter(image => image.id !== id));
+    setOverallError(''); // Clear errors if images are removed
+  };
+
+  // Function to clear all images and reset state
+  const clearAllImages = () => {
+    setSelectedImages([]);
+    setOverallLoading(false);
+    setOverallError('');
+    setCopyMessage('');
+    setImageUrlInput('');
+    // Revoke object URLs to free up memory from file uploads
+    selectedImages.forEach(image => {
+      if (image.sourceType === 'file' && image.previewUrl) {
+        URL.revokeObjectURL(image.previewUrl);
+      }
+    });
+  };
+
+  // Function to process a single image (file or URL) for alt text generation
+  const processImageForAltText = async (imageToProcess) => {
+    let base64ImageData = '';
+    let mimeType = imageToProcess.mimeType;
+    let newError = '';
+
+    if (imageToProcess.sourceType === 'file') {
+      // For file uploads, read as Data URL
+      const reader = new FileReader();
+      reader.readAsDataURL(imageToProcess.file);
+      await new Promise(resolve => {
+        reader.onloadend = () => {
+          base64ImageData = reader.result.split(',')[1];
+          resolve();
+        };
+      });
+    } else if (imageToProcess.sourceType === 'url') {
+      // For URL images, fetch and convert to Base64
+      try {
+        const response = await fetch(imageToProcess.url);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        // Attempt to get MIME type from Content-Type header
+        mimeType = response.headers.get('Content-Type') || 'image/jpeg'; // Default to jpeg if not found
+        const blob = await response.blob();
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        await new Promise(resolve => {
+          reader.onloadend = () => {
+            base64ImageData = reader.result.split(',')[1];
+            resolve();
+          };
+        });
+      } catch (err) {
+        console.error(`Error fetching image from URL ${imageToProcess.url}:`, err);
+        newError = `Failed to fetch image from URL. (CORS or network error) ${err.message}`;
+        return { altText: '', error: newError };
+      }
+    }
+
+    let newAltText = '';
+
+    try {
+      // Define the prompt for the Gemini API
+      const prompt = "Generate a concise and descriptive alt text for this image, focusing on key visual elements and context. The alt text should be suitable for accessibility purposes, typically under 125 characters. Highlight the main subject and action. Prioritize accuracy and brevity.";
+
+      // Construct the payload for the Gemini API call
+      const payload = {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  mimeType: mimeType, // Use the determined MIME type
+                  data: base64ImageData
+                }
+              }
+            ]
+          }
+        ],
+      };
+
+      const apiKey = ""; // API key is left empty; Canvas will inject it at runtime
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+      const apiResponse = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!apiResponse.ok) {
+        const errorData = await apiResponse.json();
+        throw new Error(errorData.error?.message || `Failed to generate alt text for ${imageToProcess.file?.name || imageToProcess.url}.`);
+      }
+
+      const result = await apiResponse.json();
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        newAltText = result.candidates[0].content.parts[0].text;
+      } else {
+        newError = `No alt text generated for ${imageToProcess.file?.name || imageToProcess.url}.`;
+      }
+    } catch (err) {
+      console.error(`Error generating alt text for ${imageToProcess.file?.name || imageToProcess.url}:`, err);
+      newError = `Error for ${imageToProcess.file?.name || imageToProcess.url}: ${err.message}`;
+    } finally {
+      return { altText: newAltText, error: newError };
+    }
+  };
+
+  // Function to generate alt text (batch or single)
+  const generateAltText = async (imageId = null) => {
+    if (selectedImages.length === 0) {
+      setOverallError('Please select or drop images first.');
+      return;
+    }
+
+    setOverallError('');
+    setCopyMessage('');
+
+    // If a specific imageId is provided, regenerate only that image's alt text
+    if (imageId) {
+      setSelectedImages(prevImages =>
+        prevImages.map(img =>
+          img.id === imageId ? { ...img, loading: true, error: '', altText: '' } : img
+        )
+      );
+
+      const imageToRegenerate = selectedImages.find(img => img.id === imageId);
+      if (imageToRegenerate) {
+        const { altText, error } = await processImageForAltText(imageToRegenerate);
+        setSelectedImages(prevImages =>
+          prevImages.map(img =>
+            img.id === imageToRegenerate.id ? { ...img, altText, error, loading: false } : img
+          )
+        );
+      }
+    } else { // Batch generation for all images without alt text or errors
+      setOverallLoading(true);
+      const updatedImages = [...selectedImages];
+
+      for (let i = 0; i < updatedImages.length; i++) {
+        const imageToProcess = updatedImages[i];
+        // Only process images that don't have alt text yet and no existing error
+        if (imageToProcess.altText || imageToProcess.error) continue;
+
+        updatedImages[i] = { ...imageToProcess, loading: true, error: '' };
+        setSelectedImages([...updatedImages]); // Update state to show loading for current image
+
+        const { altText, error } = await processImageForAltText(imageToProcess);
+
+        updatedImages[i] = { ...updatedImages[i], altText, error, loading: false };
+        setSelectedImages([...updatedImages]); // Update state after processing each image
+      }
+      setOverallLoading(false);
+    }
+  };
+
+  // Function to handle URL submission
+  const handleUrlGeneration = async () => {
+    if (!imageUrlInput.trim()) {
+      setOverallError('Please enter a valid image URL.');
+      return;
+    }
+
+    setUrlLoading(true);
+    setOverallError('');
+    setCopyMessage('');
+
+    // Create a temporary image object for URL processing
+    const newImageEntry = {
+      id: crypto.randomUUID(),
+      sourceType: 'url',
+      url: imageUrlInput.trim(),
+      previewUrl: imageUrlInput.trim(), // Use URL directly for preview
+      altText: '',
+      loading: true,
+      error: '',
+      mimeType: '' // Will be determined during fetch
+    };
+
+    setSelectedImages(prevImages => [...prevImages, newImageEntry]);
+    setImageUrlInput(''); // Clear input field
+
+    const { altText, error } = await processImageForAltText(newImageEntry);
+
+    setSelectedImages(prevImages =>
+      prevImages.map(img =>
+        img.id === newImageEntry.id ? { ...img, altText, error, loading: false } : img
+      )
+    );
+    setUrlLoading(false);
+  };
+
+
+  // Function to copy alt text to clipboard for a specific image
+  const copyToClipboard = (text) => {
+    if (text) {
+      const el = document.createElement('textarea');
+      el.value = text;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      setCopyMessage('Alt text copied to clipboard!');
+      setTimeout(() => setCopyMessage(''), 3000); // Clear message after 3 seconds
+    }
+  };
+
+  // Placeholder for CSV export functionality
+  const exportToCSV = () => {
+    if (selectedImages.length === 0) {
+      setOverallError('No images with alt text to export.');
+      return;
+    }
+
+    const csvRows = [];
+    // Add CSV header
+    csvRows.push('Filename/URL,Generated Alt Text');
+
+    // Add data rows
+    selectedImages.forEach(image => {
+      if (image.altText) {
+        const nameOrUrl = image.sourceType === 'file' ? image.file.name : image.url;
+        // Escape double quotes in alt text for CSV
+        const escapedAltText = image.altText.replace(/"/g, '""');
+        csvRows.push(`"${nameOrUrl}","${escapedAltText}"`);
+      }
+    });
+
+    const csvString = csvRows.join('\n');
+    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute('download', 'alt_texts.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setCopyMessage('CSV exported successfully!');
+    setTimeout(() => setCopyMessage(''), 3000);
+  };
+
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-orange-400 to-red-500 flex items-center justify-center p-4 font-inter">
+      <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-3xl transform transition-all duration-300">
+        <h1 className="text-4xl font-extrabold text-center text-gray-900 mb-8 drop-shadow-sm">
+          AI Alt Text Generator
+        </h1>
+
+        {/* Image Upload/Drag & Drop Section */}
+        <div
+          className={`mb-6 border-2 border-dashed rounded-xl p-8 text-center transition-all duration-300 ${
+            dragOver ? 'border-orange-500 bg-orange-50' : 'border-gray-300 bg-gray-50'
+          }`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          <label htmlFor="image-upload" className="cursor-pointer block">
+            <div className="text-gray-600 text-lg mb-4">
+              Drag & drop images here, or
+            </div>
+            <input
+              id="image-upload"
+              type="file"
+              accept="image/*"
+              multiple // Allow multiple file selection
+              onChange={handleImageChange}
+              className="hidden" // Hide the default input
+            />
+            <button
+              type="button"
+              onClick={() => document.getElementById('image-upload').click()}
+              className="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-sm text-white bg-orange-600 hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500 transition-all duration-200 ease-in-out transform hover:-translate-y-0.5"
+            >
+              <svg className="-ml-1 mr-2 h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm12 12H4l4-4 4 4 4-4V5h-2a1 1 0 100 2h2v6z" clipRule="evenodd" />
+              </svg>
+              Browse Files
+            </button>
+          </label>
+        </div>
+
+        {/* URL Input Section */}
+        <div className="mb-6">
+          <div className="text-center text-gray-600 text-lg mb-4">
+            Or generate from an image URL:
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <input
+              type="url"
+              placeholder="Paste image URL here (e.g., https://example.com/image.jpg)"
+              value={imageUrlInput}
+              onChange={(e) => setImageUrlInput(e.target.value)}
+              className="flex-1 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 bg-gray-50 text-gray-800"
+            />
+            <button
+              onClick={handleUrlGeneration}
+              disabled={!imageUrlInput.trim() || urlLoading}
+              className={`py-3 px-6 rounded-lg font-semibold transition duration-300 ease-in-out transform hover:-translate-y-0.5 ${
+                !imageUrlInput.trim() || urlLoading
+                  ? 'bg-gray-300 text-gray-600 cursor-not-allowed'
+                  : 'bg-red-600 text-white shadow-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500'
+              }`}
+            >
+              {urlLoading ? (
+                <div className="flex items-center justify-center">
+                  <svg className="animate-spin h-5 w-5 mr-2 text-white" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Fetching...
+                </div>
+              ) : (
+                'Generate from URL'
+              )}
+            </button>
+          </div>
+        </div>
+
+
+        {/* Action Buttons: Generate and Clear All */}
+        <div className="mb-6 flex flex-col sm:flex-row gap-4">
+          <button
+            onClick={() => generateAltText()} // Call without ID for batch processing
+            disabled={selectedImages.length === 0 || overallLoading}
+            className={`flex-1 py-4 px-6 rounded-xl font-bold text-lg transition duration-300 ease-in-out transform hover:-translate-y-0.5 ${
+              selectedImages.length === 0 || overallLoading
+                ? 'bg-gray-300 text-gray-600 cursor-not-allowed'
+                : 'bg-gradient-to-r from-teal-500 to-green-600 text-white shadow-md hover:from-teal-600 hover:to-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500'
+            }`}
+          >
+            {overallLoading ? (
+              <div className="flex items-center justify-center">
+                <svg className="animate-spin h-6 w-6 mr-3 text-white" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Generating Alt Text for all images...
+              </div>
+            ) : (
+              `Generate Alt Text for ${selectedImages.length} Image(s)`
+            )}
+          </button>
+          <button
+            onClick={clearAllImages}
+            disabled={selectedImages.length === 0 || overallLoading || urlLoading}
+            className={`flex-1 py-4 px-6 rounded-xl font-bold text-lg transition duration-300 ease-in-out transform hover:-translate-y-0.5 ${
+              selectedImages.length === 0 || overallLoading || urlLoading
+                ? 'bg-gray-300 text-gray-600 cursor-not-allowed'
+                : 'bg-rose-700 text-white shadow-md hover:bg-rose-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-600' // Unique deep rose color
+            }`}
+          >
+            Clear All Images
+          </button>
+        </div>
+
+        {/* Overall Error Message */}
+        {overallError && (
+          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-6 shadow-sm" role="alert">
+            <strong className="font-bold">Oops!</strong>
+            <span className="block sm:inline ml-2">{overallError}</span>
+          </div>
+        )}
+
+        {/* Copy Message */}
+        {copyMessage && (
+          <p className="text-green-600 text-center mt-3 font-medium animate-fade-in-down mb-4">{copyMessage}</p>
+        )}
+
+        {/* Image Previews and Generated Alt Text Display */}
+        {selectedImages.length > 0 && (
+          <div className="mb-6">
+            <h2 className="text-2xl font-semibold text-gray-800 mb-4 text-center">Uploaded Images & Alt Texts:</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {selectedImages.map(image => (
+                <div key={image.id} className="bg-gray-50 p-4 rounded-xl shadow-md border border-gray-200 relative">
+                  <button
+                    onClick={() => removeImage(image.id)}
+                    className="absolute top-2 right-2 bg-red-500 text-white rounded-full h-6 w-6 flex items-center justify-center text-sm font-bold hover:bg-red-600 transition-colors duration-200"
+                    title="Remove image"
+                  >
+                    &times;
+                  </button>
+                  <h3 className="text-lg font-medium text-gray-700 mb-2 truncate">
+                    {image.sourceType === 'file' ? image.file.name : new URL(image.url).pathname.split('/').pop() || image.url}
+                  </h3>
+                  <img
+                    src={image.previewUrl}
+                    alt={`Preview of ${image.sourceType === 'file' ? image.file.name : image.url}`}
+                    className="max-w-full h-auto rounded-lg mx-auto mb-3 border border-gray-100"
+                    style={{ maxHeight: '150px', objectFit: 'contain' }}
+                  />
+                  {image.loading && (
+                    <div className="flex items-center justify-center text-blue-600 text-sm mb-2">
+                      <svg className="animate-spin h-4 w-4 mr-2" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Generating...
+                    </div>
+                  )}
+                  {image.error && (
+                    <p className="text-red-500 text-sm mb-2">{image.error}</p>
+                  )}
+                  {image.altText && (
+                    <>
+                      <textarea
+                        readOnly
+                        value={image.altText}
+                        className="w-full p-2 border border-gray-300 rounded-lg bg-white text-gray-800 focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y text-sm"
+                        rows="3"
+                        placeholder="Generated alt text will appear here..."
+                      ></textarea>
+                      <div className="flex flex-col sm:flex-row gap-2 mt-2">
+                        <button
+                          onClick={() => copyToClipboard(image.altText)}
+                          className="flex-1 py-2 px-4 rounded-lg font-semibold text-sm bg-indigo-600 text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-200"
+                        >
+                          Copy Alt Text
+                        </button>
+                        <button
+                          onClick={() => generateAltText(image.id)} // Regenerate specific image
+                          disabled={image.loading}
+                          className={`flex-1 py-2 px-4 rounded-lg font-semibold text-sm ${
+                            image.loading
+                              ? 'bg-gray-300 text-gray-600 cursor-not-allowed'
+                              : 'bg-yellow-500 text-white hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-400'
+                          } transition-all duration-200`}
+                        >
+                          {image.loading ? 'Regenerating...' : 'Regenerate Alt Text'}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            {/* Export to CSV Button */}
+            {selectedImages.some(img => img.altText) && (
+              <div className="mt-8 text-center">
+                <button
+                  onClick={exportToCSV}
+                  className="inline-flex items-center px-8 py-4 border border-transparent text-lg font-bold rounded-full shadow-lg text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition-all duration-200 ease-in-out transform hover:-translate-y-0.5"
+                >
+                  <svg className="-ml-1 mr-3 h-6 w-6" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" />
+                  </svg>
+                  Export All to CSV
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* About Section */}
+        <div className="mt-8 pt-6 border-t border-gray-200 text-center text-gray-600 text-sm">
+          <p className="mb-2">
+            Generated by CG and Powered by Google Gemini API.
+          </p>
+          <p className="text-xs text-gray-500 mt-2">
+            Note: Generating alt text from URLs may be affected by browser security (CORS) policies. Some images might not load directly.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
